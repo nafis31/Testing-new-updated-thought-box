@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Thought Box — Universal Reasoning Chain Extractor</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>"/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'DM Sans','Segoe UI',system-ui,sans-serif;background:#f4f5f7;color:#1a1a2e;min-height:100vh}
+    #root{max-width:960px;margin:0 auto;padding:24px 16px 60px}
+    @keyframes slideBar{0%{left:-40%}100%{left:100%}}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+    .fade-in{animation:fadeIn .25s ease forwards}
+    textarea:focus,input:focus{outline:none}
+    button{font-family:inherit;cursor:pointer}
+    ::selection{background:#c5cae9}
+    .tab-scroll::-webkit-scrollbar{height:0}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useCallback,useRef,useMemo,useEffect} = React;
+
+/* ═══ COLORS & CONFIG ═══ */
+const PC = {
+  factual:{bg:"#E8F4FD",border:"#2196F3",text:"#1565C0",label:"Factual"},
+  forecast:{bg:"#FFF3E0",border:"#FF9800",text:"#E65100",label:"Forecast"},
+  causal:{bg:"#F3E5F5",border:"#9C27B0",text:"#6A1B9A",label:"Causal"},
+  moral_outcome:{bg:"#FCE4EC",border:"#E91E63",text:"#AD1457",label:"Moral (Outcome)"},
+  moral_action:{bg:"#FBE9E7",border:"#FF5722",text:"#BF360C",label:"Moral (Action)"},
+  definitional:{bg:"#E8F5E9",border:"#4CAF50",text:"#2E7D32",label:"Definitional"},
+};
+const SC = {
+  strongly_positive:{bg:"#C8E6C9",text:"#2E7D32",label:"Strongly +"},
+  moderately_positive:{bg:"#DCEDC8",text:"#558B2F",label:"Moderately +"},
+  neutral:{bg:"#F5F5F5",text:"#757575",label:"Neutral"},
+  moderately_negative:{bg:"#FFE0B2",text:"#E65100",label:"Moderately −"},
+  strongly_negative:{bg:"#FFCDD2",text:"#C62828",label:"Strongly −"},
+};
+const OPS = {"^":{symbol:"^",label:"Moral Eval",color:"#E91E63"},"+":{symbol:"+",label:"AND",color:"#37474F"},"=>":{symbol:"→",label:"Implies",color:"#455A64"}};
+
+const SAMPLE = `Nutrient loading from agricultural runoff is the primary driver of harmful algal blooms in Lake Erie. Phosphorus concentrations have exceeded safe thresholds since 2010. Climate change is intensifying rainfall events, which increases nutrient transport to the lake. If current agricultural practices continue, bloom severity will increase by 30% over the next decade. The economic cost of water treatment has already exceeded $100 million annually. Protecting public health must take priority over minimizing agricultural regulation costs. A harmful algal bloom is defined as a rapid accumulation of cyanobacteria that produces toxins dangerous to humans and wildlife. The government should implement stricter fertilizer application limits. Voluntary best management practices have failed to reduce phosphorus loading to target levels.`;
+
+/* ═══ PROMPTS ═══ */
+const EXTRACT_SYS = `You are an expert argument analyst extracting reasoning chains using a formal framework.
+PREMISE TYPES (mutually exclusive):
+1. factual — current/historical empirical state. "X is/was the case"
+2. forecast — predicted future state. "X will happen"
+3. causal — cause-effect. "X causes Y"
+4. moral_outcome — evaluates a consequence. "X outcome is good/bad"
+5. moral_action — evaluates an action. "Doing X is right/wrong"
+6. definitional — semantic boundary. "X is defined as Y"
+SENTIMENT (moral premises only): strongly_positive|moderately_positive|neutral|moderately_negative|strongly_negative. Non-moral=""
+EXPLICIT vs IMPLICIT: Extract ALL logically necessary implicit premises.
+OPERATORS:
+^ Moral Eval: left=non-moral, right=moral ONLY
++ AND: combine non-moral premises, ^ results, relationships. NEVER moral or conclusions.
+=> Implication: source=non-moral/^/+/R. Target=non-moral premise or conclusion. NEVER moral.
+Extract multiple conclusions if present. Keep premise content CONCISE (1-2 sentences max). Keep relationship descriptions SHORT (under 15 words). This ensures the full JSON fits in the response.
+Return ONLY valid JSON:
+[{"id":"C1","conclusion":"text","confidence_coefficient":85,"reasoning_chains":[{"chain_id":1,"premises":[{"id":"P1","content":"text","type":"factual","explicit":true,"confidence_coefficient":85,"sentiment":""}],"relationships":[{"id":"R1","operator":"^","expression":"P1 ^ P2","description":"text"}]}]}]`;
+
+const VALID_SYS = `Validate the reasoning chains. Fix violations:
+1. Conclusions=final endpoints only. Never label intermediate claims as conclusions.
+2. No logical gaps. Add implicit premises for: causal mechanisms behind forecasts, moral assumptions, intermediate steps, definitions.
+3. ^ left=non-moral right=moral ONLY. + never moral/conclusions. => never target moral.
+4. Every premise used in a relationship. Every relationship leads to conclusion.
+5. Final step must be => targeting Cx.
+6. Moral premises=evaluations not directives. Only right side of ^.
+7. Sentiment on all moral premises. "" on non-moral.
+Return corrected JSON array only.`;
+
+const DISAGREE_SYS = `You are an expert at identifying disagreements between reasoning chains from different stakeholders.
+Given two sets of reasoning chains (Stakeholder A and Stakeholder B), analyze:
+1. DISAGREEMENT CHECK: Do the conclusions conflict? Are supporting premises logically incompatible?
+2. DIVERGENCE IDENTIFICATION: Find ALL points where premises conflict. Classify each divergence as: factual, forecast, causal, moral, or definitional.
+3. DEPENDENCY CHECK: For each divergence, determine if it depends on an earlier divergence.
+4. ROOT DIVERGENCE: The earliest divergence(s) that don't depend on others. This is the fundamental source of disagreement.
+Return ONLY valid JSON:
+{"has_disagreement":true,"summary":"Brief description","divergences":[{"id":"D1","stakeholder_a_premise":{"id":"P3","content":"text","type":"causal"},"stakeholder_b_premise":{"id":"P7","content":"text","type":"causal"},"divergence_type":"causal","description":"What they disagree about","depends_on":[],"is_root":true}],"root_divergence_summary":"The fundamental disagreement is...","resolution_path":"This divergence could be resolved by..."}`;
+
+/* ═══ API & PARSE ═══ */
+async function callAPI(apiKey, sys, msgs, retries=2) {
+  for(let attempt=0;attempt<=retries;attempt++){
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:16000,temperature:0,system:sys,messages:msgs}),
+    });
+    const d = await r.json();
+    if(d.error) throw new Error(d.error.message);
+    const text = d.content?.map(c=>c.text||"").join("")||"";
+    if(d.stop_reason==="max_tokens" && attempt<retries){
+      msgs=[...msgs,{role:"assistant",content:text},{role:"user",content:"Your JSON was cut off. Continue from exactly where you stopped. Output ONLY the remaining JSON."}];
+      continue;
+    }
+    return text;
+  }
+}
+
+function parseJ(t) {
+  let c = t.replace(/```json\s*/g,"").replace(/```\s*/g,"").trim();
+  try { return JSON.parse(c); } catch(e1) {
+    try { return JSON.parse(`[${c}]`); } catch(e2) {
+      let r = c;
+      r = r.replace(/,\s*$/,"");
+      const qc = (r.match(/(?<!\\)"/g)||[]).length;
+      if(qc % 2 !== 0) r += '"';
+      r = r.replace(/,\s*"[^"]*"?\s*:?\s*"?[^"]*$/,"");
+      const ob=(r.match(/{/g)||[]).length, cb=(r.match(/}/g)||[]).length;
+      const oq=(r.match(/\[/g)||[]).length, cq=(r.match(/\]/g)||[]).length;
+      for(let i=0;i<ob-cb;i++) r+="}";
+      for(let i=0;i<oq-cq;i++) r+="]";
+      try { return JSON.parse(r); } catch(e3) {
+        try { return JSON.parse(`[${r}]`); } catch(e4) {
+          throw new Error("Could not parse response. Try with shorter text or key argumentative sections only.");
+        }
+      }
+    }
+  }
+}
+
+/* ═══ SUPABASE LAYER ═══ */
+function createSupaClient(url, key) {
+  if(!url || !key) return null;
+  try { return supabase.createClient(url, key); } catch { return null; }
+}
+
+function useSupabase() {
+  const [sbUrl] = useState(()=>{try{return localStorage.getItem("tb_sb_url")||""}catch{return""}});
+  const [sbKey] = useState(()=>{try{return localStorage.getItem("tb_sb_key")||""}catch{return""}});
+  const client = useMemo(()=>createSupaClient(sbUrl, sbKey), [sbUrl, sbKey]);
+  const isConnected = !!client;
+
+  const loadAll = useCallback(async ()=>{
+    if(!client) return null;
+    try {
+      const {data, error} = await client.from("analyses").select("*").order("created_at",{ascending:false});
+      if(error) throw error;
+      return data.map(r=>({id:r.id, label:r.label, data:r.chain_data, author:r.author||"", created_at:r.created_at}));
+    } catch(e) { console.error("Supabase load error:", e); return null; }
+  },[client]);
+
+  const saveOne = useCallback(async (label, data, author)=>{
+    if(!client) return false;
+    try {
+      const {error} = await client.from("analyses").insert({label, chain_data:data, author:author||"anonymous"});
+      if(error) throw error;
+      return true;
+    } catch(e) { console.error("Supabase save error:", e); return false; }
+  },[client]);
+
+  const deleteOne = useCallback(async (id)=>{
+    if(!client) return false;
+    try {
+      const {error} = await client.from("analyses").delete().eq("id", id);
+      if(error) throw error;
+      return true;
+    } catch(e) { console.error("Supabase delete error:", e); return false; }
+  },[client]);
+
+  return { isConnected, loadAll, saveOne, deleteOne, sbUrl, sbKey };
+}
+
+/* ═══ SMALL COMPONENTS ═══ */
+function Badge({type}){const c=PC[type]||PC.factual;return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,letterSpacing:".4px",textTransform:"uppercase",background:c.bg,color:c.text,border:`1.5px solid ${c.border}`}}>{c.label}</span>}
+function SBadge({s}){if(!s)return null;const v=SC[s];if(!v)return null;return <span style={{display:"inline-block",padding:"2px 7px",borderRadius:8,fontSize:10,fontWeight:700,background:v.bg,color:v.text}}>{v.label}</span>}
+function CBar({v}){const color=v>=80?"#4CAF50":v>=60?"#FF9800":"#f44336";return <div style={{display:"flex",alignItems:"center",gap:5}}><div style={{width:50,height:5,borderRadius:3,background:"#e0e0e0",overflow:"hidden"}}><div style={{width:`${v}%`,height:"100%",borderRadius:3,background:color,transition:"width .5s"}}/></div><span style={{fontSize:10,color:"#888",fontWeight:600}}>{v}</span></div>}
+function OBadge({op}){const o=OPS[op]||OPS["=>"];return <span style={{display:"inline-flex",alignItems:"center",gap:3,padding:"2px 7px",borderRadius:6,fontSize:10,fontWeight:700,background:"#ECEFF1",color:o.color,fontFamily:"'JetBrains Mono',monospace"}}><span style={{fontSize:13}}>{o.symbol}</span> {o.label}</span>}
+
+function PCard({p,sel,onClick}){const c=PC[p.type]||PC.factual;return(
+  <div className="fade-in" onClick={onClick} style={{padding:"10px 14px",borderRadius:9,border:`2px solid ${sel?c.border:"#e0e0e0"}`,background:sel?c.bg:"#fff",cursor:"pointer",transition:"all .2s",boxShadow:sel?`0 2px 10px ${c.border}33`:"0 1px 2px #0001",marginBottom:6}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:5,flexWrap:"wrap",gap:4}}>
+      <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}>
+        <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,fontWeight:800,color:c.text,background:c.bg,padding:"1px 6px",borderRadius:4}}>{p.id}</span>
+        <Badge type={p.type}/>{p.sentiment&&<SBadge s={p.sentiment}/>}
+        <span style={{fontSize:9,padding:"1px 5px",borderRadius:5,background:p.explicit?"#E3F2FD":"#FFF8E1",color:p.explicit?"#1565C0":"#F57F17",fontWeight:700,textTransform:"uppercase"}}>{p.explicit?"explicit":"implicit"}</span>
+      </div>
+      <CBar v={p.confidence_coefficient||80}/>
+    </div>
+    <p style={{margin:0,fontSize:12.5,lineHeight:1.5,color:"#333"}}>{p.content}</p>
+  </div>
+)}
+
+function RStep({r,prems}){
+  const tokens=r.expression.split(/\s+/);
+  return(
+    <div className="fade-in" style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 12px",borderRadius:7,background:"#fff",border:"1px solid #e8e8e8",marginBottom:6}}>
+      <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,fontWeight:800,color:"#37474F",minWidth:28,paddingTop:2}}>{r.id}:</span>
+      <div style={{flex:1}}>
+        <div style={{display:"flex",flexWrap:"wrap",alignItems:"center",gap:4,marginBottom:4}}>
+          {tokens.map((t,i)=>{
+            if(["^","+","=>"].includes(t)){const o=OPS[t];return <span key={i} style={{fontSize:12,fontWeight:700,color:o?.color||"#78909C",fontFamily:"'JetBrains Mono',monospace"}}>{o?.symbol||t}</span>}
+            const p=prems.find(x=>x.id===t);const c=p?(PC[p.type]||PC.factual):null;const isC=t.startsWith("C");
+            return <span key={i} style={{fontFamily:"'JetBrains Mono',monospace",fontSize:10,fontWeight:700,color:isC?"#fff":c?c.text:"#455A64",background:isC?"#1a1a2e":c?c.bg:"#ECEFF1",padding:"1px 5px",borderRadius:3}}>{t}</span>
+          })}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap"}}><OBadge op={r.operator}/><span style={{fontSize:11,color:"#666",lineHeight:1.4}}>{r.description}</span></div>
+      </div>
+    </div>
+  )
+}
+
+function Stats({prems,concs,rels}){
+  const tc={};prems.forEach(p=>{tc[p.type]=(tc[p.type]||0)+1});
+  const avg=prems.length?Math.round(prems.reduce((s,p)=>s+(p.confidence_coefficient||0),0)/prems.length):0;
+  const ex=prems.filter(p=>p.explicit).length;
+  return(
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(100px,1fr))",gap:7,padding:12,borderRadius:10,background:"linear-gradient(135deg,#1a1a2e,#16213e)"}}>
+      {[{v:concs.length,l:"Conclusions",c:"#90CAF9"},{v:prems.length,l:"Premises",c:"#CE93D8"},{v:rels.length,l:"Steps",c:"#A5D6A7"},{v:`${avg}%`,l:"Avg Conf",c:"#FFE082"},{v:`${ex}/${prems.length-ex}`,l:"Expl/Impl",c:"#80DEEA"}].map((x,i)=>(
+        <div key={i} style={{textAlign:"center"}}><div style={{fontSize:20,fontWeight:800,color:"#fff"}}>{x.v}</div><div style={{fontSize:9,color:x.c,textTransform:"uppercase",letterSpacing:".4px"}}>{x.l}</div></div>
+      ))}
+      {Object.entries(tc).map(([t,n])=>{const c=PC[t];return <div key={t} style={{textAlign:"center"}}><div style={{fontSize:20,fontWeight:800,color:c?.border||"#fff"}}>{n}</div><div style={{fontSize:9,color:c?.border||"#aaa",textTransform:"uppercase"}}>{c?.label||t}</div></div>})}
+    </div>
+  )
+}
+
+function DBar({prems}){
+  const tc={};prems.forEach(p=>{tc[p.type]=(tc[p.type]||0)+1});const tot=prems.length||1;
+  return(
+    <div style={{padding:12,borderRadius:10,background:"#fff",border:"1px solid #e0e0e0",marginTop:10}}>
+      <div style={{fontSize:11,fontWeight:700,color:"#333",marginBottom:8,textTransform:"uppercase"}}>Premise Distribution</div>
+      <div style={{display:"flex",borderRadius:6,overflow:"hidden",height:24,marginBottom:8}}>
+        {Object.entries(tc).map(([t,n])=>{const c=PC[t];const pct=((n/tot)*100).toFixed(1);return <div key={t} style={{width:`${pct}%`,background:c?.border||"#999",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:10,fontWeight:700,minWidth:n>0?20:0}} title={`${c?.label}: ${n}`}>{pct>14?`${pct}%`:""}</div>})}
+      </div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+        {Object.entries(tc).map(([t,n])=>{const c=PC[t];return <div key={t} style={{display:"flex",alignItems:"center",gap:3}}><div style={{width:8,height:8,borderRadius:2,background:c?.border||"#999"}}/><span style={{fontSize:10,color:"#666"}}>{c?.label} ({n})</span></div>})}
+      </div>
+    </div>
+  )
+}
+
+function DivCard({d}){
+  const c=PC[d.divergence_type]||PC.factual;
+  return(
+    <div className="fade-in" style={{padding:"14px 16px",borderRadius:10,border:`2px solid ${d.is_root?"#FF6F00":c.border}`,background:d.is_root?"#FFF8E1":"#fff",marginBottom:8,boxShadow:d.is_root?"0 2px 12px #FF6F0022":"0 1px 2px #0001"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+        <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,fontWeight:800,color:d.is_root?"#E65100":"#455A64",background:d.is_root?"#FFE0B2":"#ECEFF1",padding:"2px 8px",borderRadius:5}}>{d.id}</span>
+        <Badge type={d.divergence_type}/>
+        {d.is_root&&<span style={{fontSize:10,fontWeight:800,padding:"2px 8px",borderRadius:6,background:"#FF6F00",color:"#fff",textTransform:"uppercase",letterSpacing:".5px"}}>ROOT DIVERGENCE</span>}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:8}}>
+        <div style={{padding:"8px 10px",borderRadius:7,background:"#E3F2FD",border:"1px solid #90CAF9"}}>
+          <div style={{fontSize:9,fontWeight:700,color:"#1565C0",textTransform:"uppercase",marginBottom:3}}>Stakeholder A</div>
+          <div style={{fontSize:10,fontWeight:600,color:"#1565C0",marginBottom:2}}>{d.stakeholder_a_premise?.id}</div>
+          <div style={{fontSize:11.5,color:"#333",lineHeight:1.4}}>{d.stakeholder_a_premise?.content}</div>
+        </div>
+        <div style={{padding:"8px 10px",borderRadius:7,background:"#FFF3E0",border:"1px solid #FFB74D"}}>
+          <div style={{fontSize:9,fontWeight:700,color:"#E65100",textTransform:"uppercase",marginBottom:3}}>Stakeholder B</div>
+          <div style={{fontSize:10,fontWeight:600,color:"#E65100",marginBottom:2}}>{d.stakeholder_b_premise?.id}</div>
+          <div style={{fontSize:11.5,color:"#333",lineHeight:1.4}}>{d.stakeholder_b_premise?.content}</div>
+        </div>
+      </div>
+      <p style={{margin:0,fontSize:12,color:"#555",lineHeight:1.5}}>{d.description}</p>
+    </div>
+  )
+}
+
+/* ═══ MODALS ═══ */
+function KeyModal({onSave}){
+  const [k,setK]=useState("");
+  return(
+    <div style={{position:"fixed",inset:0,background:"#000a",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+      <div style={{background:"#fff",borderRadius:16,padding:30,maxWidth:440,width:"100%",boxShadow:"0 20px 60px #0003"}}>
+        <div style={{fontSize:26,marginBottom:4}}>🔑</div>
+        <h2 style={{fontSize:18,fontWeight:800,marginBottom:6}}>Anthropic API Key</h2>
+        <p style={{fontSize:12,color:"#666",lineHeight:1.6,marginBottom:14}}>Your key stays <strong>only in your browser</strong>. Get one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style={{color:"#3949AB"}}>console.anthropic.com</a></p>
+        <input type="password" value={k} onChange={e=>setK(e.target.value)} placeholder="sk-ant-..." style={{width:"100%",padding:"10px 12px",borderRadius:8,border:"2px solid #e0e0e0",fontSize:13,fontFamily:"'JetBrains Mono',monospace",marginBottom:12}}/>
+        <button onClick={()=>{if(k.trim())onSave(k.trim())}} disabled={!k.trim()} style={{width:"100%",padding:"10px",borderRadius:8,border:"none",background:k.trim()?"linear-gradient(135deg,#1a1a2e,#0f3460)":"#ccc",color:"#fff",fontSize:14,fontWeight:700}}>Save & Start</button>
+      </div>
+    </div>
+  )
+}
+
+function SupabaseSetup({onSave, onSkip}){
+  const [url,setUrl]=useState("");
+  const [key,setKey]=useState("");
+  return(
+    <div style={{position:"fixed",inset:0,background:"#000a",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}>
+      <div style={{background:"#fff",borderRadius:16,padding:30,maxWidth:500,width:"100%",boxShadow:"0 20px 60px #0003"}}>
+        <div style={{fontSize:26,marginBottom:4}}>☁️</div>
+        <h2 style={{fontSize:18,fontWeight:800,marginBottom:4}}>Team Cloud Storage (Optional)</h2>
+        <p style={{fontSize:12,color:"#666",lineHeight:1.6,marginBottom:6}}>
+          Connect Supabase so your team can share saved analyses. Everyone using this site will see the same saved data.
+        </p>
+        <p style={{fontSize:11,color:"#999",lineHeight:1.5,marginBottom:14}}>
+          Free at <a href="https://supabase.com" target="_blank" rel="noopener" style={{color:"#3949AB"}}>supabase.com</a>. See the setup guide (README) for the 3-minute setup.
+        </p>
+        <div style={{marginBottom:10}}>
+          <label style={{fontSize:11,fontWeight:700,color:"#555",display:"block",marginBottom:3}}>Supabase Project URL</label>
+          <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" style={{width:"100%",padding:"9px 11px",borderRadius:7,border:"1.5px solid #e0e0e0",fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}/>
+        </div>
+        <div style={{marginBottom:14}}>
+          <label style={{fontSize:11,fontWeight:700,color:"#555",display:"block",marginBottom:3}}>Supabase Anon Key</label>
+          <input value={key} onChange={e=>setKey(e.target.value)} placeholder="eyJ..." style={{width:"100%",padding:"9px 11px",borderRadius:7,border:"1.5px solid #e0e0e0",fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}/>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>{if(url.trim()&&key.trim())onSave(url.trim(),key.trim())}} disabled={!url.trim()||!key.trim()} style={{flex:1,padding:"10px",borderRadius:8,border:"none",background:(url.trim()&&key.trim())?"linear-gradient(135deg,#1a1a2e,#0f3460)":"#ccc",color:"#fff",fontSize:13,fontWeight:700}}>Connect</button>
+          <button onClick={onSkip} style={{padding:"10px 20px",borderRadius:8,border:"1.5px solid #e0e0e0",background:"#fff",color:"#666",fontSize:13,fontWeight:600}}>Skip (Local Only)</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ══════════════ MAIN APP ══════════════ */
+function App(){
+  // API Key
+  const [apiKey,setApiKey]=useState(()=>{try{return localStorage.getItem("tb_key")||""}catch{return""}});
+  const [showKey,setShowKey]=useState(!apiKey);
+
+  // Supabase
+  const [showSbSetup,setShowSbSetup]=useState(()=>{
+    try{return !localStorage.getItem("tb_sb_done")}catch{return true}
+  });
+  const sb = useSupabase();
+
+  // Core state
+  const [text,setText]=useState("");
+  const [label,setLabel]=useState("");
+  const [author,setAuthor]=useState(()=>{try{return localStorage.getItem("tb_author")||""}catch{return""}});
+  const [result,setResult]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [stage,setStage]=useState("");
+  const [error,setError]=useState(null);
+  const [selP,setSelP]=useState(null);
+  const [tab,setTab]=useState("input");
+  const [cIdx,setCIdx]=useState(0);
+  const [saved,setSaved]=useState([]);
+  const [cmpSel,setCmpSel]=useState([]);
+  const [file,setFile]=useState(null);
+  const [b64,setB64]=useState(null);
+  const [mode,setMode]=useState("text");
+  const [fname,setFname]=useState("");
+  const [drag,setDrag]=useState(false);
+  const fRef=useRef(null);
+  const [daPair,setDaPair]=useState([null,null]);
+  const [daResult,setDaResult]=useState(null);
+  const [daLoading,setDaLoading]=useState(false);
+  const [daError,setDaError]=useState(null);
+  const [dbStatus,setDbStatus]=useState(""); // "cloud" | "local"
+
+  // Init: load from Supabase or localStorage
+  useEffect(()=>{
+    async function init(){
+      if(sb.isConnected){
+        const cloud = await sb.loadAll();
+        if(cloud!==null){
+          setSaved(cloud);
+          setDbStatus("cloud");
+          return;
+        }
+      }
+      // Fallback to localStorage
+      try{const s=localStorage.getItem("tb_s");if(s)setSaved(JSON.parse(s))}catch{}
+      setDbStatus("local");
+    }
+    if(!showKey && !showSbSetup) init();
+  },[sb.isConnected, showKey, showSbSetup]);
+
+  const saveKey=k=>{setApiKey(k);try{localStorage.setItem("tb_key",k)}catch{};setShowKey(false)};
+  const saveSb=(url,key)=>{try{localStorage.setItem("tb_sb_url",url);localStorage.setItem("tb_sb_key",key);localStorage.setItem("tb_sb_done","1")}catch{};window.location.reload()};
+  const skipSb=()=>{try{localStorage.setItem("tb_sb_done","1")}catch{};setShowSbSetup(false)};
+
+  const refreshSaved=useCallback(async()=>{
+    if(sb.isConnected){
+      const cloud=await sb.loadAll();
+      if(cloud!==null){setSaved(cloud);setDbStatus("cloud");return}
+    }
+    try{const s=localStorage.getItem("tb_s");if(s)setSaved(JSON.parse(s))}catch{}
+    setDbStatus("local");
+  },[sb]);
+
+  const persistLocal=a=>{try{localStorage.setItem("tb_s",JSON.stringify(a))}catch{}};
+
+  const allP=useMemo(()=>{if(!result)return[];const a=[];result.forEach(c=>c.reasoning_chains?.forEach(ch=>ch.premises?.forEach(p=>{if(!a.find(x=>x.id===p.id))a.push(p)})));return a},[result]);
+  const allR=useMemo(()=>{if(!result)return[];const a=[];result.forEach(c=>c.reasoning_chains?.forEach(ch=>ch.relationships?.forEach(r=>{if(!a.find(x=>x.id===r.id))a.push(r)})));return a},[result]);
+
+  const handleFile=useCallback(f=>{
+    if(!f)return;const ext=f.name.split(".").pop().toLowerCase();
+    if(!["pdf","docx","txt","md"].includes(ext)){setError("Upload PDF, DOCX, TXT, or MD.");return}
+    setFname(f.name);setError(null);
+    if(ext==="txt"||ext==="md"){const r=new FileReader();r.onload=e=>{setText(e.target.result);setMode("text");setFile(f)};r.readAsText(f)}
+    else{const r=new FileReader();r.onload=e=>{setB64(e.target.result.split(",")[1]);setMode("pdf");setFile(f)};r.readAsDataURL(f)}
+  },[]);
+
+  const analyze=useCallback(async()=>{
+    if(mode==="text"&&!text.trim())return;if(mode==="pdf"&&!b64)return;
+    setLoading(true);setError(null);setStage("Pass 1: Extracting premises...");
+    try{
+      let uc;
+      if(mode==="pdf"&&b64){const ext=fname.split(".").pop().toLowerCase();const mt=ext==="docx"?"application/vnd.openxmlformats-officedocument.wordprocessingml.document":"application/pdf";uc=[{type:"document",source:{type:"base64",media_type:mt,data:b64}},{type:"text",text:"Analyze this document. Extract all conclusions, premises, reasoning chains. Return ONLY valid JSON."}]}
+      else{uc=`Analyze:\n${text}\nReturn ONLY valid JSON.`}
+      const m1=[{role:"user",content:uc}];
+      const r1=await callAPI(apiKey,EXTRACT_SYS,m1);
+      setStage("Pass 2: Validating chains...");
+      let parsed;
+      try{
+        const m2=[{role:"user",content:uc},{role:"assistant",content:r1},{role:"user",content:VALID_SYS}];
+        const r2=await callAPI(apiKey,EXTRACT_SYS,m2);
+        parsed=parseJ(r2);
+      }catch(e2){parsed=parseJ(r1)}
+      setResult(Array.isArray(parsed)?parsed:[parsed]);setCIdx(0);setTab("premises");
+    }catch(e){if(e.message?.includes("auth"))setShowKey(true);else setError(`Failed: ${e.message}`)}
+    finally{setLoading(false);setStage("")}
+  },[text,mode,b64,fname,apiKey]);
+
+  const saveA=useCallback(async()=>{
+    if(!result)return;
+    const l=label.trim()||fname||`Analysis ${saved.length+1}`;
+    if(sb.isConnected){
+      const ok=await sb.saveOne(l, result, author);
+      if(ok){await refreshSaved();setLabel("");return}
+    }
+    // Fallback local
+    const updated=[...saved,{label:l,data:result,author:author||"local"}];
+    setSaved(updated);persistLocal(updated);setLabel("");
+  },[result,label,fname,saved,sb,author,refreshSaved]);
+
+  const delA=useCallback(async(i)=>{
+    const item=saved[i];
+    if(sb.isConnected && item?.id){
+      await sb.deleteOne(item.id);
+      await refreshSaved();
+    } else {
+      const updated=saved.filter((_,j)=>j!==i);
+      setSaved(updated);persistLocal(updated);
+    }
+    setCmpSel(p=>p.filter(x=>x!==i).map(x=>x>i?x-1:x));
+    setDaPair([null,null]);setDaResult(null);
+  },[saved,sb,refreshSaved]);
+
+  const clearIn=()=>{setText("");setFile(null);setB64(null);setFname("");setMode("text");setResult(null);setError(null);if(fRef.current)fRef.current.value=""};
+  const togCmp=i=>setCmpSel(p=>p.includes(i)?p.filter(x=>x!==i):p.length<3?[...p,i]:p);
+  const expJ=(d,n)=>{const b=new Blob([JSON.stringify(d,null,2)],{type:"application/json"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`${n||"chain"}-${Date.now()}.json`;a.click();URL.revokeObjectURL(u)};
+
+  const runDisagree=useCallback(async()=>{
+    if(daPair[0]===null||daPair[1]===null)return;
+    const a=saved[daPair[0]],b=saved[daPair[1]];if(!a||!b)return;
+    setDaLoading(true);setDaError(null);setDaResult(null);
+    try{
+      const compact=d=>(d.data||d).map(c=>({id:c.id,conclusion:c.conclusion,chains:c.reasoning_chains?.map(ch=>({premises:ch.premises?.map(p=>({id:p.id,content:p.content,type:p.type,explicit:p.explicit})),relationships:ch.relationships?.map(r=>({id:r.id,operator:r.operator,expression:r.expression,description:r.description}))}))}));
+      const prompt=`Compare these two stakeholders' reasoning chains and identify divergence points and root divergence.\n\nSTAKEHOLDER A: "${a.label}"\n${JSON.stringify(compact(a))}\n\nSTAKEHOLDER B: "${b.label}"\n${JSON.stringify(compact(b))}\n\nReturn ONLY valid JSON.`;
+      const r=await callAPI(apiKey,DISAGREE_SYS,[{role:"user",content:prompt}]);
+      const parsed=parseJ(r);setDaResult(Array.isArray(parsed)?parsed[0]:parsed);
+    }catch(e){setDaError(`Failed: ${e.message}`)}
+    finally{setDaLoading(false)}
+  },[daPair,saved,apiKey]);
+
+  const tS=(t,dis)=>({padding:"8px 13px",border:"none",borderBottom:tab===t?"3px solid #1a1a2e":"3px solid transparent",background:"none",fontSize:12,fontWeight:tab===t?700:500,color:dis?"#ccc":tab===t?"#1a1a2e":"#888",transition:"all .2s",whiteSpace:"nowrap",cursor:dis?"default":"pointer"});
+  const canA=mode==="text"?text.trim().length>0:!!b64;
+  const cc=result?.[cIdx];
+  const cP=cc?.reasoning_chains?.flatMap(ch=>ch.premises||[])||[];
+  const cR=cc?.reasoning_chains?.flatMap(ch=>ch.relationships||[])||[];
+
+  if(showKey) return <KeyModal onSave={saveKey}/>;
+  if(showSbSetup && apiKey) return <SupabaseSetup onSave={saveSb} onSkip={skipSb}/>;
+
+  return(
+    <div>
+      {/* Header */}
+      <div style={{marginBottom:20,textAlign:"center"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8,marginBottom:4}}>
+          <div style={{width:34,height:34,borderRadius:9,background:"linear-gradient(135deg,#1a1a2e,#0f3460)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17}}>🧠</div>
+          <h1 style={{fontSize:24,fontWeight:800,letterSpacing:"-.5px"}}>Thought Box</h1>
+        </div>
+        <p style={{fontSize:11,color:"#888",maxWidth:500,margin:"0 auto 4px"}}>Extract reasoning chains, compare stakeholders, find root divergences.</p>
+        <div style={{display:"flex",justifyContent:"center",gap:10,alignItems:"center"}}>
+          <span style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:dbStatus==="cloud"?"#E8F5E9":"#FFF8E1",color:dbStatus==="cloud"?"#2E7D32":"#F57F17",fontWeight:600}}>{dbStatus==="cloud"?"☁️ Cloud Synced":"💾 Local Only"}</span>
+          <button onClick={()=>setShowKey(true)} style={{fontSize:10,color:"#bbb",background:"none",border:"none",textDecoration:"underline"}}>API Key</button>
+          <button onClick={()=>{try{localStorage.removeItem("tb_sb_done");localStorage.removeItem("tb_sb_url");localStorage.removeItem("tb_sb_key")}catch{};window.location.reload()}} style={{fontSize:10,color:"#bbb",background:"none",border:"none",textDecoration:"underline"}}>Cloud Settings</button>
+        </div>
+      </div>
+
+      {/* Author field for cloud mode */}
+      {dbStatus==="cloud"&&!author&&<div style={{padding:"10px 14px",borderRadius:8,background:"#E3F2FD",border:"1px solid #90CAF9",marginBottom:14,display:"flex",alignItems:"center",gap:8}}>
+        <span style={{fontSize:12,color:"#1565C0",fontWeight:600}}>Your name (for team attribution):</span>
+        <input placeholder="e.g., Defne" style={{flex:1,padding:"6px 10px",borderRadius:6,border:"1.5px solid #90CAF9",fontSize:12}} onKeyDown={e=>{if(e.key==="Enter"&&e.target.value.trim()){setAuthor(e.target.value.trim());try{localStorage.setItem("tb_author",e.target.value.trim())}catch{}}}}/>
+      </div>}
+
+      {/* Tabs */}
+      <div className="tab-scroll" style={{display:"flex",borderBottom:"1px solid #e0e0e0",marginBottom:16,overflowX:"auto"}}>
+        <button style={tS("input",false)} onClick={()=>setTab("input")}>Input</button>
+        <button style={tS("premises",!result)} onClick={()=>result&&setTab("premises")}>Premises</button>
+        <button style={tS("chain",!result)} onClick={()=>result&&setTab("chain")}>Chain</button>
+        <button style={tS("stats",!result)} onClick={()=>result&&setTab("stats")}>Overview</button>
+        <button style={tS("compare",false)} onClick={()=>{setTab("compare");refreshSaved()}}>Saved {saved.length>0?`(${saved.length})`:""}</button>
+        <button style={tS("disagree",saved.length<2)} onClick={()=>{if(saved.length>=2){setTab("disagree");refreshSaved()}}}>Divergence</button>
+      </div>
+
+      {/* ── INPUT ── */}
+      {tab==="input"&&<div>
+        <div onClick={()=>!file&&fRef.current?.click()} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);handleFile(e.dataTransfer.files?.[0])}} style={{padding:file?"12px 16px":"28px 16px",borderRadius:10,border:`2px dashed ${file?"#4CAF50":drag?"#1a1a2e":"#c5cae9"}`,background:file?"#E8F5E9":drag?"#e8eaf6":"#fff",textAlign:"center",cursor:file?"default":"pointer",transition:"all .2s",marginBottom:12}}>
+          <input ref={fRef} type="file" accept=".pdf,.docx,.txt,.md" style={{display:"none"}} onChange={e=>handleFile(e.target.files?.[0])}/>
+          {file?<div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,flexWrap:"wrap"}}><span style={{fontSize:24}}>{fname.endsWith(".pdf")?"📄":"📝"}</span><div style={{textAlign:"left"}}><div style={{fontSize:13,fontWeight:700,color:"#2E7D32"}}>{fname}</div><div style={{fontSize:11,color:"#66BB6A"}}>{(file.size/1024).toFixed(0)} KB</div></div><button onClick={e=>{e.stopPropagation();clearIn()}} style={{padding:"3px 10px",borderRadius:5,border:"1px solid #ccc",background:"#fff",fontSize:11,color:"#666",fontWeight:600}}>Remove</button></div>
+          :<div><div style={{fontSize:30,marginBottom:4,opacity:.7}}>📎</div><div style={{fontSize:13,fontWeight:700,color:"#3949AB",marginBottom:2}}>Drop file or click to upload</div><div style={{fontSize:11,color:"#999"}}>PDF, DOCX, TXT, MD</div></div>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}><div style={{flex:1,height:1,background:"#e0e0e0"}}/><span style={{fontSize:10,color:"#ccc",fontWeight:600}}>OR PASTE</span><div style={{flex:1,height:1,background:"#e0e0e0"}}/></div>
+        <textarea value={text} onChange={e=>{setText(e.target.value);if(e.target.value&&mode==="pdf"){setMode("text");setFile(null);setB64(null);setFname("")}}} placeholder="Paste text..." style={{width:"100%",minHeight:130,padding:12,borderRadius:8,border:"2px solid #e0e0e0",fontSize:13,lineHeight:1.7,fontFamily:"'DM Sans',sans-serif",resize:"vertical",background:mode==="pdf"?"#f5f5f5":"#fff",opacity:mode==="pdf"?.4:1}}/>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:10,flexWrap:"wrap",gap:6}}>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <button onClick={()=>{setText(SAMPLE);setMode("text");setFile(null);setB64(null);setFname("")}} style={{padding:"6px 12px",borderRadius:6,border:"1.5px solid #e0e0e0",background:"#fff",fontSize:11,color:"#666",fontWeight:600}}>Sample</button>
+            {mode==="text"&&text&&<span style={{fontSize:10,color:"#aaa"}}>{text.split(/\s+/).filter(Boolean).length} words</span>}
+          </div>
+          <button onClick={analyze} disabled={loading||!canA} style={{padding:"9px 24px",borderRadius:8,border:"none",background:loading?"#999":"linear-gradient(135deg,#1a1a2e,#0f3460)",color:"#fff",fontSize:13,fontWeight:700,opacity:!canA?.5:1}}>{loading?"Analyzing...":"Extract"}</button>
+        </div>
+        {loading&&<div style={{marginTop:18,textAlign:"center"}}><div style={{fontSize:12,color:"#555",marginBottom:2}}>{stage}</div><div style={{fontSize:11,color:"#999",marginBottom:10}}>Two-pass: ~30–90 sec</div><div style={{width:180,height:3,borderRadius:2,background:"#e0e0e0",margin:"0 auto",overflow:"hidden",position:"relative"}}><div style={{width:"40%",height:"100%",borderRadius:2,background:"linear-gradient(90deg,#1a1a2e,#0f3460)",animation:"slideBar 1.5s ease-in-out infinite",position:"absolute"}}/></div></div>}
+        {error&&<div style={{marginTop:8,padding:"8px 12px",borderRadius:6,background:"#FFEBEE",color:"#C62828",fontSize:12}}>{error}</div>}
+      </div>}
+
+      {/* Conclusion selector */}
+      {(tab==="premises"||tab==="chain")&&result&&result.length>1&&<div style={{display:"flex",gap:5,marginBottom:12,flexWrap:"wrap"}}>{result.map((c,i)=><button key={i} onClick={()=>setCIdx(i)} style={{padding:"5px 12px",borderRadius:6,border:`1.5px solid ${i===cIdx?"#1a1a2e":"#e0e0e0"}`,background:i===cIdx?"#1a1a2e":"#fff",color:i===cIdx?"#fff":"#666",fontSize:11,fontWeight:700}}>{c.id||`C${i+1}`}</button>)}</div>}
+
+      {/* ── PREMISES ── */}
+      {tab==="premises"&&result&&cc&&<div>
+        <div style={{padding:"10px 14px",borderRadius:8,background:"#f0f4ff",border:"1.5px solid #c5cae9",marginBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}><div style={{fontSize:10,fontWeight:700,color:"#3949AB",textTransform:"uppercase"}}>{cc.id||"C1"}</div><CBar v={cc.confidence_coefficient||80}/></div>
+          <div style={{fontSize:13,fontWeight:600,lineHeight:1.5}}>{cc.conclusion}</div>
+        </div>
+        {cP.map(p=><PCard key={p.id} p={p} sel={selP===p.id} onClick={()=>setSelP(selP===p.id?null:p.id)}/>)}
+      </div>}
+
+      {/* ── CHAIN ── */}
+      {tab==="chain"&&result&&cc&&<div>
+        <div style={{fontSize:11,color:"#777",marginBottom:12,display:"flex",gap:12,flexWrap:"wrap"}}>{Object.entries(OPS).map(([k,o])=><span key={k} style={{display:"flex",alignItems:"center",gap:3}}><span style={{fontFamily:"monospace",fontSize:14,fontWeight:700,color:o.color}}>{o.symbol}</span><span>{o.label}</span></span>)}</div>
+        {cR.map(r=><RStep key={r.id} r={r} prems={cP}/>)}
+        <div style={{marginTop:12,padding:"12px 14px",borderRadius:8,background:"linear-gradient(135deg,#1a1a2e,#16213e)",color:"#fff"}}>
+          <div style={{fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:".4px",marginBottom:2,color:"#90CAF9"}}>{cc.id||"C1"}</div>
+          <div style={{fontSize:13,fontWeight:600,lineHeight:1.5}}>{cc.conclusion}</div>
+        </div>
+      </div>}
+
+      {/* ── STATS ── */}
+      {tab==="stats"&&result&&<div>
+        <Stats prems={allP} concs={result} rels={allR}/>
+        <DBar prems={allP}/>
+        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:12}}>
+          <input value={label} onChange={e=>setLabel(e.target.value)} placeholder={`Label (e.g., "${fname||"EPA Report"}")`} style={{flex:1,minWidth:140,padding:"7px 10px",borderRadius:6,border:"1.5px solid #e0e0e0",fontSize:12,fontFamily:"'DM Sans',sans-serif"}}/>
+          <button onClick={saveA} style={{padding:"7px 14px",borderRadius:6,border:"none",background:"#1a1a2e",color:"#fff",fontSize:12,fontWeight:700}}>Save {dbStatus==="cloud"?"to Cloud":"Locally"}</button>
+          <button onClick={()=>expJ(result,fname||"analysis")} style={{padding:"7px 14px",borderRadius:6,border:"1.5px solid #1a1a2e",background:"#fff",color:"#1a1a2e",fontSize:12,fontWeight:700}}>JSON</button>
+        </div>
+      </div>}
+
+      {/* ── SAVED ── */}
+      {tab==="compare"&&<div>
+        {saved.length===0?<div style={{textAlign:"center",padding:30,color:"#999"}}><div style={{fontSize:30,marginBottom:8}}>📊</div><div style={{fontSize:13,fontWeight:600}}>No saved analyses yet</div><div style={{fontSize:12,marginTop:4}}>{dbStatus==="cloud"?"No team analyses in the cloud yet.":"Save analyses from the Overview tab."}</div></div>
+        :<div>
+          <div style={{fontSize:12,color:"#666",marginBottom:12}}>{dbStatus==="cloud"?"☁️ Showing team analyses from cloud database.":"💾 Showing locally saved analyses."} Select 2–3 to compare.</div>
+          {saved.map((a,i)=>{const sel=cmpSel.includes(i);const aData=a.data||[];const aP=[];aData.forEach(c=>c.reasoning_chains?.forEach(ch=>ch.premises?.forEach(p=>{if(!aP.find(x=>x.id===p.id))aP.push(p)})));
+            return <div key={a.id||i} style={{padding:"10px 14px",borderRadius:8,border:`2px solid ${sel?"#1a1a2e":"#e0e0e0"}`,background:sel?"#f0f4ff":"#fff",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+              <div onClick={()=>togCmp(i)} style={{flex:1,cursor:"pointer"}}>
+                <div style={{display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:13,fontWeight:700}}>{a.label}</span>{a.author&&<span style={{fontSize:10,color:"#999",fontStyle:"italic"}}>by {a.author}</span>}</div>
+                <div style={{fontSize:11,color:"#999"}}>{aData.length} conc · {aP.length} premises</div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:5}}>
+                <button onClick={e=>{e.stopPropagation();expJ(aData,a.label)}} style={{fontSize:10,padding:"2px 6px",borderRadius:3,border:"1px solid #ddd",background:"#fff",color:"#666"}}>JSON</button>
+                <button onClick={e=>{e.stopPropagation();delA(i)}} style={{fontSize:10,padding:"2px 6px",borderRadius:3,border:"1px solid #ffcdd2",background:"#fff",color:"#e53935"}}>Del</button>
+                <div onClick={()=>togCmp(i)} style={{width:18,height:18,borderRadius:4,border:`2px solid ${sel?"#1a1a2e":"#ccc"}`,background:sel?"#1a1a2e":"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>{sel&&"✓"}</div>
+              </div>
+            </div>
+          })}
+          {cmpSel.length>=2&&<div style={{marginTop:16}}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>Comparison</div>
+            <div style={{display:"grid",gridTemplateColumns:`repeat(${cmpSel.length},1fr)`,gap:8}}>
+              {cmpSel.map(i=>{const a=saved[i];if(!a)return null;const tc={};const aData=a.data||[];const aP=[];aData.forEach(c=>c.reasoning_chains?.forEach(ch=>ch.premises?.forEach(p=>{if(!aP.find(x=>x.id===p.id))aP.push(p)})));aP.forEach(p=>{tc[p.type]=(tc[p.type]||0)+1});
+                return <div key={a.id||i} style={{padding:12,borderRadius:8,border:"1.5px solid #e0e0e0",background:"#fff"}}>
+                  <div style={{fontSize:12,fontWeight:700,marginBottom:6}}>{a.label}</div>
+                  {aData.map((c,j)=><div key={j} style={{fontSize:11,color:"#444",marginBottom:4,paddingLeft:6,borderLeft:"2px solid #c5cae9"}}>{c.conclusion}</div>)}
+                  <div style={{marginTop:6}}>{Object.entries(PC).map(([t,c])=><div key={t} style={{display:"flex",justifyContent:"space-between",padding:"2px 0",borderBottom:"1px solid #f0f0f0"}}><span style={{fontSize:11,color:c.text,fontWeight:600}}>{c.label}</span><span style={{fontSize:12,fontWeight:800,color:c.border}}>{tc[t]||0}</span></div>)}</div>
+                </div>
+              })}
+            </div>
+          </div>}
+        </div>}
+      </div>}
+
+      {/* ── DIVERGENCE ── */}
+      {tab==="disagree"&&<div>
+        <div style={{padding:"14px 16px",borderRadius:10,background:"linear-gradient(135deg,#1a1a2e,#0f3460)",color:"#fff",marginBottom:16}}>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>Pairwise Divergence Analysis</div>
+          <div style={{fontSize:12,opacity:.8,lineHeight:1.5}}>Select two saved analyses. Find the <strong>root divergence</strong> — the fundamental source of disagreement.</div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
+          {[0,1].map(slot=>(
+            <div key={slot}>
+              <div style={{fontSize:11,fontWeight:700,color:slot===0?"#1565C0":"#E65100",textTransform:"uppercase",marginBottom:6}}>Stakeholder {slot===0?"A":"B"}</div>
+              {saved.map((a,i)=>{
+                const sel=daPair[slot]===i;const other=daPair[slot===0?1:0]===i;
+                return <div key={a.id||i} onClick={()=>{if(!other){const np=[...daPair];np[slot]=sel?null:i;setDaPair(np);setDaResult(null)}}} style={{padding:"8px 12px",borderRadius:7,border:`2px solid ${sel?slot===0?"#1565C0":"#E65100":"#e0e0e0"}`,background:sel?slot===0?"#E3F2FD":"#FFF3E0":other?"#f5f5f5":"#fff",cursor:other?"default":"pointer",opacity:other?.4:1,marginBottom:5,transition:"all .2s"}}>
+                  <div style={{fontSize:12,fontWeight:700,color:other?"#999":"#333"}}>{a.label}</div>
+                  <div style={{fontSize:10,color:"#999"}}>{(a.data||[]).length} conclusions {a.author?`· ${a.author}`:""}</div>
+                </div>
+              })}
+            </div>
+          ))}
+        </div>
+
+        {daPair[0]!==null&&daPair[1]!==null&&!daResult&&<div style={{textAlign:"center",marginBottom:16}}>
+          <button onClick={runDisagree} disabled={daLoading} style={{padding:"10px 28px",borderRadius:8,border:"none",background:daLoading?"#999":"linear-gradient(135deg,#E65100,#FF6F00)",color:"#fff",fontSize:14,fontWeight:700}}>
+            {daLoading?"Analyzing...":"Find Root Divergence"}
+          </button>
+          {daLoading&&<div style={{marginTop:12}}><div style={{fontSize:12,color:"#555"}}>Comparing reasoning chains...</div><div style={{width:180,height:3,borderRadius:2,background:"#e0e0e0",margin:"8px auto 0",overflow:"hidden",position:"relative"}}><div style={{width:"40%",height:"100%",borderRadius:2,background:"linear-gradient(90deg,#E65100,#FF6F00)",animation:"slideBar 1.5s ease-in-out infinite",position:"absolute"}}/></div></div>}
+        </div>}
+
+        {daError&&<div style={{padding:"8px 12px",borderRadius:6,background:"#FFEBEE",color:"#C62828",fontSize:12,marginBottom:12}}>{daError}</div>}
+
+        {daResult&&<div className="fade-in">
+          <div style={{padding:"14px 16px",borderRadius:10,background:daResult.has_disagreement?"#FFF8E1":"#E8F5E9",border:`1.5px solid ${daResult.has_disagreement?"#FFB74D":"#66BB6A"}`,marginBottom:14}}>
+            <div style={{fontSize:11,fontWeight:700,color:daResult.has_disagreement?"#E65100":"#2E7D32",textTransform:"uppercase",marginBottom:4}}>{daResult.has_disagreement?"Disagreement Found":"No Fundamental Disagreement"}</div>
+            <div style={{fontSize:13,fontWeight:600,lineHeight:1.5,color:"#333"}}>{daResult.summary}</div>
+          </div>
+          {daResult.root_divergence_summary&&<div style={{padding:"12px 14px",borderRadius:8,background:"linear-gradient(135deg,#E65100,#FF6F00)",color:"#fff",marginBottom:14}}>
+            <div style={{fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:".4px",marginBottom:3,opacity:.8}}>Root Divergence</div>
+            <div style={{fontSize:13,fontWeight:600,lineHeight:1.5}}>{daResult.root_divergence_summary}</div>
+          </div>}
+          {daResult.resolution_path&&<div style={{padding:"10px 14px",borderRadius:8,background:"#E8F5E9",border:"1px solid #A5D6A7",marginBottom:14}}>
+            <div style={{fontSize:10,fontWeight:700,color:"#2E7D32",textTransform:"uppercase",marginBottom:3}}>Resolution Path</div>
+            <div style={{fontSize:12,color:"#333",lineHeight:1.5}}>{daResult.resolution_path}</div>
+          </div>}
+          {daResult.divergences?.length>0&&<div>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:8}}>All Divergence Points ({daResult.divergences.length})</div>
+            {(()=>{const tc={};daResult.divergences.forEach(d=>{tc[d.divergence_type]=(tc[d.divergence_type]||0)+1});const tot=daResult.divergences.length;
+              return <div style={{display:"flex",borderRadius:6,overflow:"hidden",height:24,marginBottom:12}}>
+                {Object.entries(tc).map(([t,n])=>{const c=PC[t]||PC.factual;const pct=((n/tot)*100).toFixed(0);return <div key={t} style={{width:`${pct}%`,background:c.border,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:10,fontWeight:700,minWidth:24}} title={`${c.label}: ${n}`}>{n>0?`${c.label} ${n}`:""}</div>})}
+              </div>})()}
+            {daResult.divergences.filter(d=>d.is_root).map(d=><DivCard key={d.id} d={d}/>)}
+            {daResult.divergences.filter(d=>!d.is_root).map(d=><DivCard key={d.id} d={d}/>)}
+          </div>}
+          <div style={{marginTop:12,textAlign:"right"}}><button onClick={()=>expJ(daResult,"divergence")} style={{padding:"7px 14px",borderRadius:6,border:"1.5px solid #1a1a2e",background:"#fff",color:"#1a1a2e",fontSize:12,fontWeight:700}}>Export JSON</button></div>
+        </div>}
+      </div>}
+
+      <div style={{textAlign:"center",marginTop:30,padding:"12px 0",borderTop:"1px solid #eee",fontSize:10,color:"#ccc"}}>Thought Box v4 · Two-pass extraction + Divergence analysis · {dbStatus==="cloud"?"☁️ Cloud":"💾 Local"}</div>
+    </div>
+  )
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
