@@ -93,3 +93,17 @@ Give your friends:
 
 ## License
 MIT
+**
+##Examples of Reasoning Chains:**
+
+P1 (factual): Phosphorus levels exceed safe thresholds
+P2 (causal): Agricultural runoff causes phosphorus loading
+P3 (forecast): Blooms will worsen by 30% in 10 years
+P4 (moral_outcome): Worsening blooms threatening public health is bad
+P5 (factual): Voluntary practices have failed
+
+R1: P1 + P2 => P3        (high phosphorus + runoff causes it → blooms will worsen)
+R2: P3 ^ P4              (worsening blooms evaluated as bad)
+R3: R2 + P5 => C1        (it's bad + voluntary failed → regulate)
+
+C1: Government should implement stricter fertilizer limits
